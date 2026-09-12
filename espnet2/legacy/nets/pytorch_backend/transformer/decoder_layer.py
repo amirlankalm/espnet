@@ -79,6 +79,7 @@ class DecoderLayer(nn.Module):
         cache=None,
         pre_memory=None,
         pre_memory_mask=None,
+        memory_kv=None,
     ):
         """Compute decoded features.
 
@@ -91,6 +92,10 @@ class DecoderLayer(nn.Module):
                 Each tensor shape should be (#batch, maxlen_out - 1, size).
             pre_memory (torch.Tensor): Encoded memory (#batch, maxlen_in, size).
             pre_memory_mask (torch.Tensor): Encoded memory mask (#batch, maxlen_in).
+            memory_kv (Tuple[torch.Tensor, torch.Tensor]): Key and value of
+                `memory` already transformed by `self.src_attn.forward_kv`, so
+                that decoding steps do not transform them again. Each is
+                (#batch or 1, n_head, maxlen_in, size / n_head).
 
         Returns:
             torch.Tensor: Output tensor(#batch, maxlen_out, size).
@@ -154,13 +159,14 @@ class DecoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm2(x)
-        if self.concat_after:
-            x_concat = torch.cat(
-                (x, self.src_attn(x, memory, memory, memory_mask)), dim=-1
-            )
-            x = residual + self.concat_linear2(x_concat)
+        if memory_kv is None:
+            src = self.src_attn(x, memory, memory, memory_mask)
         else:
-            x = residual + self.dropout(self.src_attn(x, memory, memory, memory_mask))
+            src = self.src_attn.forward_with_kv(x, *memory_kv, memory_mask)
+        if self.concat_after:
+            x = residual + self.concat_linear2(torch.cat((x, src), dim=-1))
+        else:
+            x = residual + self.dropout(src)
         if not self.normalize_before:
             x = self.norm2(x)
 

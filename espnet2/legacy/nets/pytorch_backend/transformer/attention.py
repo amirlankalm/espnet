@@ -150,6 +150,69 @@ class MultiHeadedAttention(nn.Module):
 
         return self.linear_out(x)  # (batch, time1, d_model)
 
+    def forward_kv(self, key, value):
+        """Transform key and value only.
+
+        The result can be kept and given to :meth:`forward_with_kv` for many
+        queries, e.g. at every step of a beam search, whose encoder output does
+        not change from one step to the next.
+
+        Args:
+            key (torch.Tensor): Key tensor (#batch, time2, size).
+            value (torch.Tensor): Value tensor (#batch, time2, size).
+
+        Returns:
+            torch.Tensor: Transformed key tensor (#batch, n_head, time2, d_k).
+            torch.Tensor: Transformed value tensor (#batch, n_head, time2, d_k).
+        """
+        n_batch = key.size(0)
+        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+        return self.k_norm(k), v
+
+    def forward_with_kv(self, query, k, v, mask):
+        """Attend with key and value transformed by :meth:`forward_kv`.
+
+        This is :meth:`forward` without the key and value projections. `k` and
+        `v` may have batch size 1 when every query attends to the same key and
+        value; they are then broadcast over the query batch. The flash
+        attention implementation is not used here.
+
+        Args:
+            query (torch.Tensor): Query tensor (#batch, time1, size).
+            k (torch.Tensor): Transformed key (#batch or 1, n_head, time2, d_k).
+            v (torch.Tensor): Transformed value (#batch or 1, n_head, time2, d_k).
+            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
+                (#batch, time1, time2).
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, time1, d_model).
+        """
+        n_batch = query.size(0)
+        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)
+        q = self.q_norm(q)
+        if k.size(0) != n_batch:
+            k = k.expand(n_batch, -1, -1, -1)
+            v = v.expand(n_batch, -1, -1, -1)
+        return self._attend(q, k, v, mask)
+
+    def _attend(self, q, k, v, mask):
+        """Attend with transformed q, k and v (#batch, n_head, time, d_k)."""
+        if getattr(self, "use_sdpa", False):
+            # The shape of mask must be broadcastable to the shape of attention weights
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                mask.unsqueeze(1) if mask is not None else None,
+                dropout_p=self.dropout_rate if self.training else 0.0,
+            )  # (batch, head, time1, d_k)
+            out = out.transpose(1, 2)  # (batch, time1, head, d_k)
+            out = out.reshape(out.shape[0], out.shape[1], -1)  # (batch, time1, d_model)
+            return self.linear_out(out)  # (batch, time1, d_model)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        return self.forward_attention(v, scores, mask)
+
     def forward(self, query, key, value, mask, expand_kv=False):
         """Compute scaled dot product attention.
 
@@ -172,19 +235,7 @@ class MultiHeadedAttention(nn.Module):
         # Use PyTorch's Scaled Dot Product Attention implementation
         if getattr(self, "use_sdpa", False):
             q, k, v = self.forward_qkv(query, key, value, expand_kv)
-
-            # The shape of mask must be broadcastable to the shape of attention weights
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                mask.unsqueeze(1) if mask is not None else None,
-                dropout_p=self.dropout_rate if self.training else 0.0,
-            )  # (batch, head, time1, d_k)
-
-            out = out.transpose(1, 2)  # (batch, time1, head, d_k)
-            out = out.reshape(out.shape[0], out.shape[1], -1)  # (batch, time1, d_model)
-            return self.linear_out(out)  # (batch, time1, d_model)
+            return self._attend(q, k, v, mask)
 
         # Use Flash Attention implementation
         if self.use_flash_attn:
@@ -261,8 +312,7 @@ class MultiHeadedAttention(nn.Module):
 
         # Fall back to the default implementation
         q, k, v = self.forward_qkv(query, key, value, expand_kv)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-        return self.forward_attention(v, scores, mask)
+        return self._attend(q, k, v, mask)
 
 
 class LegacyRelPositionMultiHeadedAttention(MultiHeadedAttention):

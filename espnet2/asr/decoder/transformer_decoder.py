@@ -4,7 +4,7 @@
 """Decoder definition."""
 
 import logging
-from typing import Any, List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 from typeguard import typechecked
@@ -108,6 +108,9 @@ class BaseTransformerDecoder(
         # Must set by the inheritance
         self.decoders = None
         self.batch_ids = None
+        # see memory_kv()
+        self.cache_memory_kv = True
+        self._memory_kv_cache = None
 
         # For gradient checkpointing, start from 1 (not 0)
         self.gradient_checkpoint_layers = gradient_checkpoint_layers
@@ -197,6 +200,7 @@ class BaseTransformerDecoder(
         *,
         cache: List[torch.Tensor] = None,
         return_hs: bool = False,
+        memory_kv: List[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Forward one step.
 
@@ -210,6 +214,9 @@ class BaseTransformerDecoder(
             cache: cached output list of (batch, max_time_out-1, size)
             return_hs: dec hidden state corresponding to ys,
                 used for searchable hidden ints
+            memory_kv: key and value of `memory` transformed by the source
+                attention of every layer, as returned by :meth:`memory_kv`;
+                when given, the layers do not transform `memory` again
         Returns:
             y, cache: NN output value and cache per `self.decoders`.
             y.shape` is (batch, maxlen_out, token)
@@ -217,10 +224,12 @@ class BaseTransformerDecoder(
         x = self.embed(tgt)
         if cache is None:
             cache = [None] * len(self.decoders)
+        if memory_kv is None:
+            memory_kv = [None] * len(self.decoders)
         new_cache = []
-        for c, decoder in zip(cache, self.decoders):
+        for c, kv, decoder in zip(cache, memory_kv, self.decoders):
             x, tgt_mask, memory, memory_mask = decoder(
-                x, tgt_mask, memory, memory_mask, cache=c
+                x, tgt_mask, memory, memory_mask, cache=c, memory_kv=kv
             )
             new_cache.append(x)
 
@@ -237,25 +246,86 @@ class BaseTransformerDecoder(
             return (y, hidden), new_cache
         return y, new_cache
 
+    def memory_kv(
+        self, memory: torch.Tensor
+    ) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Key and value of `memory` transformed by every layer's source attention.
+
+        The encoder output does not change during a beam search, yet
+        :meth:`forward_one_step` would transform it again at every step, for
+        every hypothesis. The transformed key and value of the last memory
+        tensor are kept here and reused as long as the same tensor (same
+        storage, shape and strides) is passed again; :meth:`init_state`, which
+        the beam search calls before decoding an utterance, drops them. When
+        `memory` is one utterance expanded over the hypotheses (a stride-0
+        view), a single copy is transformed and broadcast at attention time.
+
+        Set `self.cache_memory_kv = False` to disable this and get None.
+
+        Args:
+            memory: encoded memory, float32 (batch, maxlen_in, feat)
+
+        Returns:
+            One (key, value) pair per layer, each (batch or 1, n_head,
+            maxlen_in, d_k), or None when caching is disabled.
+        """
+        if not self.cache_memory_kv:
+            return None
+        key = (
+            memory.data_ptr(),
+            tuple(memory.shape),
+            tuple(memory.stride()),
+            memory.dtype,
+            memory.device,
+        )
+        if not memory.is_inference():
+            # counts in-place modifications; inference tensors do not have it
+            key += (memory._version,)
+        cached = self._memory_kv_cache
+        if cached is None or cached[0] != key:
+            if memory.size(0) > 1 and memory.stride(0) == 0:
+                memory_1 = memory[:1]
+                kv = [
+                    layer.src_attn.forward_kv(memory_1, memory_1)
+                    for layer in self.decoders
+                ]
+            else:
+                kv = [
+                    layer.src_attn.forward_kv(memory, memory) for layer in self.decoders
+                ]
+            # `memory` is kept so that its storage cannot be given to another
+            # tensor while its transformed key and value are cached
+            cached = self._memory_kv_cache = (key, memory, kv)
+        return cached[2]
+
+    def init_state(self, x: torch.Tensor):
+        """Get an initial state for decoding; also drops the memory_kv cache."""
+        self._memory_kv_cache = None
+        return None
+
     def score(self, ys, state, x, return_hs=False):
         """Score."""
         ys_mask = subsequent_mask(len(ys), device=x.device).unsqueeze(0)
+        memory = x.unsqueeze(0)
+        memory_kv = self.memory_kv(memory)
         if return_hs:
             (logp, hs), state = self.forward_one_step(
                 ys.unsqueeze(0),
                 ys_mask,
-                x.unsqueeze(0),
+                memory,
                 cache=state,
                 return_hs=return_hs,
+                memory_kv=memory_kv,
             )
             return logp.squeeze(0), hs, state
         else:
             logp, state = self.forward_one_step(
                 ys.unsqueeze(0),
                 ys_mask,
-                x.unsqueeze(0),
+                memory,
                 cache=state,
                 return_hs=return_hs,
+                memory_kv=memory_kv,
             )
             return logp.squeeze(0), state
 
@@ -300,6 +370,7 @@ class BaseTransformerDecoder(
 
         # batch decoding
         ys_mask = subsequent_mask(ys.size(-1), device=xs.device).unsqueeze(0)
+        memory_kv = self.memory_kv(xs)
         if return_hs:
             (logp, hs), states = self.forward_one_step(
                 ys,
@@ -308,6 +379,7 @@ class BaseTransformerDecoder(
                 memory_mask=xs_mask,
                 cache=batch_state,
                 return_hs=return_hs,
+                memory_kv=memory_kv,
             )
         else:
             logp, states = self.forward_one_step(
@@ -317,6 +389,7 @@ class BaseTransformerDecoder(
                 memory_mask=xs_mask,
                 cache=batch_state,
                 return_hs=return_hs,
+                memory_kv=memory_kv,
             )
 
         # transpose state of [layer, batch] into [batch, layer]
