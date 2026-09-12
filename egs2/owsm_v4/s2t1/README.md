@@ -59,6 +59,55 @@ The CTC segmentation algorithm assigns a score to each utterance, which indicate
 
 Finally, we convert the filtered data into Kaldi format using `local/convert_to_kaldi.py`. The resulting data is stored in `data`.
 
+## Open ASR Leaderboard samples and CPU decoding speed
+
+`local/run_hf_asr_leaderboard.sh` samples about 100 utterances from several test sets of the [Open ASR Leaderboard](https://huggingface.co/datasets/hf-audio/open-asr-leaderboard) and measures the WER and RTFx of an OWSM checkpoint on them, so that a change to the inference code can be checked on a laptop in a few minutes. WER is computed as on the leaderboard (Whisper English text normalizer, corpus-level WER with jiwer). RTFx is the total audio duration divided by the decoding time; model loading and one warm-up batch are not counted.
+
+The dataset is gated: accept the terms on its page and log in with `huggingface-cli login` (or set `HF_TOKEN`). `jiwer` and `openai-whisper` are needed for the scoring.
+
+```bash
+# six sets, 100 utterances each, OWSM v4 base, batch 8 sorted by length, early stopping
+local/run_hf_asr_leaderboard.sh --model_tag espnet/owsm_v4_base_102M --batch_size 8 --sort true --early_stop true
+
+# one set, one configuration
+python local/prepare_hf_asr_leaderboard.py --dataset librispeech --split test.clean --n 100 --out data/lb_librispeech_test_clean
+python local/eval_hf_asr_leaderboard.py --data data/lb_librispeech_test_clean --model_tag espnet/owsm_v4_base_102M \
+    --batch_size 8 --sort true --early_stop true --out exp/hf_asr_leaderboard/test_clean.json
+```
+
+The Hub copies of the test sets are sorted by length, longest first, so the first N rows would be the N longest utterances; the script takes a seeded shuffle instead and skips utterances longer than 30 s, the fixed input length of OWSM. The samples are written as Kaldi-style data directories (`wav.scp`, `text`, `utt2dur`, ...) under `data/lb_*`, so they can also be decoded with the usual recipe stages. `info.json` in each directory records how the sample was drawn.
+
+### Results on CPU
+
+Apple M4 laptop, 4 threads, PyTorch 2.12 (CPU), `maxlenratio=1.0`, `ctc_weight=0`, with the early stopping and decoder key/value cache of the companion PRs. Decoding time only. 100 utterances per set, drawn with seed 0 (`info.json` has the details); the samples are small, so the WER columns compare decoding configurations on the same utterances rather than the models on the full test sets.
+
+| set | utterances | audio (min) | mean length (s) |
+| --- | ---: | ---: | ---: |
+| test-clean | 100 | 13.8 | 8.3 |
+| test-other | 100 | 11.8 | 7.1 |
+| AMI | 100 | 8.2 | 4.9 |
+| VoxPopuli | 100 | 18.6 | 11.2 |
+| Earnings-22 | 100 | 13.1 | 7.8 |
+| Common Voice | 100 | 12.4 | 7.5 |
+
+| decoding (WER % / RTFx) | test-clean | test-other | AMI | VoxPopuli | Earnings-22 | Common Voice |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| beam 5, batch 1, no early stop | 3.35 / 0.8 | - | - | - | - | - |
+| beam 5, batch 1, early stop | 3.35 / 12.7 | 9.31 / 13.1 | 16.77 / 10.2 | 5.37 / 16.3 | 16.61 / 14.6 | 19.39 / 16.2 |
+| beam 5, batch 8 sorted, early stop | 3.35 / 18.1 | 9.31 / 16.2 | 16.77 / 14.0 | 5.37 / 24.9 | 16.61 / 18.4 | 19.39 / 23.0 |
+| greedy, batch 8 sorted | 3.57 / 29.0 | 9.78 / 27.7 | 29.63 / 15.0 | 5.69 / 42.2 | 16.50 / 31.6 | 20.81 / 29.9 |
+| 370M: beam 5, batch 8 sorted, early stop | 2.32 / 5.2 | 6.31 / 5.2 | 12.65 / 3.8 | 3.96 / 6.9 | 14.03 / 6.0 | 15.15 / 6.7 |
+
+What the rows mean:
+
+- The baseline decodes each utterance alone and runs the beam search to the maximum length. OWSM v4 pads every input to 30 s, so the maximum length is 374 steps whatever the utterance, and once the real transcript has ended the remaining beams keep producing punctuation and fragments over the padded silence. About 97% of the baseline time is spent there.
+- `--early_stop true` stops an utterance as soon as its n-best list cannot change any more (the best running hypothesis already scores below the n-th ended one). The transcripts are identical to the baseline on all 100 utterances of every set above.
+- The decoder follows Algorithm 1 of Watanabe et al. (2017), whose end detection (Eq. 50) exists in ESPnet as `end_detect`, but the beam search only consults it when `maxlenratio=0`. For a 30 s input that is the same 374-step cap as `maxlenratio=1.0`, so `--maxlenratio 0` alone already gives most of the gain (RTFx 8.8 against 10.1 for `--early_stop` at batch 1 on test-clean, identical transcripts). `--early_stop` has no thresholds and fires a few steps earlier.
+- `--batch_size 8 --sort true` decodes eight utterances of similar length in one beam search (`Speech2Text.batch_decode`). Also identical transcripts. Unsorted batches are slower than batch 1 with early stopping, because a batch runs until its longest transcript has ended.
+- The decoder caches the transformed key and value of the encoder output across decoding steps (companion PR, on by default), which is part of the speed of every row except the baseline.
+- Greedy decoding (`--beam_size 1`) is faster still but not safe: on AMI it falls into repetition loops on some utterances and the WER almost doubles.
+- Also tried and not worth it on this machine: encoding the true utterance length instead of 30 s (WER 3.35 -> 10.2, the model needs the padded context), padding to 10 to 20 s buckets or to speech plus a short tail (WER +0.1 to +1.2 for at most 1.3x), bfloat16 (30x slower on the CPU), int8 dynamic quantization (WER +1.8 and slower), 8 or 10 threads instead of 4, and SDPA in the decoder (no change).
+
 ## OWSM series
 
 ### Encoder-decoder OWSM
