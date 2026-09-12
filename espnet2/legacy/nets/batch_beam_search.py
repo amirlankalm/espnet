@@ -1157,10 +1157,59 @@ class BatchBeamSearch(BeamSearch):
                 best,
                 ended_hyps if batched else ended_hyps[0],
             )
+            if self.early_stop > 0:
+                running_hyps = self._early_stop_utterances(
+                    running_hyps, ended_hyps, n_utt
+                )
             if bool(running_hyps.done_mask().all()):
                 logger.info(f"decoding finished at position {i}")
                 break
         return ended_hyps
+
+    def _early_stop_utterances(
+        self,
+        running_hyps: BatchHypothesis,
+        ended_hyps: List[List[Hypothesis]],
+        n_utt: int,
+    ) -> BatchHypothesis:
+        """Mark an utterance done once its ``early_stop``-best list is final.
+
+        The per-utterance form of :meth:`BeamSearch.early_stop_reached`: an
+        utterance with at least ``early_stop`` ended hypotheses whose
+        ``early_stop``-th best scores at least as high as every hypothesis
+        still running for it has its slots deactivated, so the batch finishes
+        as soon as every utterance has reached that point instead of when every
+        slot has emitted <eos> or hit maxlen.
+        """
+        if len(running_hyps) == 0:
+            return running_hyps
+        active = running_hyps.active_mask()
+        done = running_hyps.done_mask().clone()
+        n_hyp = running_hyps.n_hyp_per_utt
+        k = self.early_stop
+        changed = False
+        for b in range(n_utt):
+            if bool(done[b]) or len(ended_hyps[b]) < k:
+                continue
+            lo, hi = b * n_hyp, (b + 1) * n_hyp
+            act = active[lo:hi]
+            if not bool(act.any()):
+                continue
+            scores = running_hyps.score[lo:hi]
+            best_running = float(scores[act.to(scores.device)].max())
+            kth_ended = sorted((float(h.score) for h in ended_hyps[b]), reverse=True)[
+                k - 1
+            ]
+            if kth_ended >= best_running:
+                if not changed:
+                    active = active.clone()
+                    changed = True
+                active[lo:hi] = False
+                done[b] = True
+                logger.info(f"early stop for utterance {b}: its {k}-best are final")
+        if not changed:
+            return running_hyps
+        return running_hyps.replace(active=active, done=done)
 
     def _retry_empty(
         self,

@@ -48,6 +48,7 @@ class BeamSearch(torch.nn.Module):
         return_hs: bool = False,
         hyp_primer: List[int] = None,
         normalize_length: bool = False,
+        early_stop: int = 0,
     ):
         """Initialize beam search.
 
@@ -119,6 +120,21 @@ class BeamSearch(torch.nn.Module):
         )
         self.return_hs = return_hs
         self.normalize_length = normalize_length
+        # early_stop=k stops the search as soon as k hypotheses have ended and
+        # the k-th best of them scores at least as high as every running one,
+        # so the k-best list can no longer change. 0 disables it. Exact when
+        # every score is non-increasing in the hypothesis length, which holds
+        # for decoder and LM log-probabilities and CTC prefix scores, but not
+        # with a positive length bonus or with length-normalized selection.
+        self.early_stop = int(early_stop)
+        if self.early_stop > 0 and (
+            self.weights.get("length_bonus", 0.0) > 0 or normalize_length
+        ):
+            logger.warning(
+                "early_stop can change the result together with a positive "
+                "length_bonus or normalize_length, since a longer hypothesis "
+                "may then overtake the best ended one"
+            )
 
     def set_hyp_primer(self, hyp_primer: List[int] = None) -> None:
         """Set the primer sequence for decoding.
@@ -443,6 +459,9 @@ class BeamSearch(torch.nn.Module):
             if maxlenratio == 0.0 and end_detect([h.asdict() for h in ended_hyps], i):
                 logger.info(f"end detected at {i}")
                 break
+            if self.early_stop_reached(running_hyps, ended_hyps):
+                logger.info(f"early stop at {i}: the {self.early_stop}-best are final")
+                break
             if len(running_hyps) == 0:
                 logger.info("no hypothesis. Finish decoding.")
                 break
@@ -496,6 +515,24 @@ class BeamSearch(torch.nn.Module):
                 + "please consider to increase the maxlenratio."
             )
         return nbest_hyps
+
+    def early_stop_reached(
+        self, running_hyps: List[Hypothesis], ended_hyps: List[Hypothesis]
+    ) -> bool:
+        """Return True once the ``early_stop``-best ended hypotheses are final.
+
+        Scores are sums of log-probabilities, so a hypothesis can only lose
+        score as it grows. Once ``early_stop`` hypotheses have ended and the
+        worst of the best ``early_stop`` of them scores at least as high as
+        every running one, no running hypothesis can enter that list, and the
+        search can stop.
+        """
+        k = self.early_stop
+        if k <= 0 or len(ended_hyps) < k or len(running_hyps) == 0:
+            return False
+        kth_ended = sorted((float(h.score) for h in ended_hyps), reverse=True)[k - 1]
+        best_running = max(float(h.score) for h in running_hyps)
+        return kth_ended >= best_running
 
     def post_process(
         self,

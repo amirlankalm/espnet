@@ -185,6 +185,7 @@ class Speech2Text:
         penalty: float = 0.0,
         nbest: int = 1,
         normalize_length: bool = False,
+        early_stop: bool = False,
         quantize_s2t_model: bool = False,
         quantize_lm: bool = False,
         quantize_modules: List[str] = ["Linear"],
@@ -309,6 +310,7 @@ class Speech2Text:
                 token_list=token_list,
                 pre_beam_score_key=None if ctc_weight == 1.0 else "full",
                 normalize_length=normalize_length,
+                early_stop=nbest if early_stop else 0,
             )
 
             # TODO(karita): make all scorers batchfied
@@ -877,6 +879,7 @@ def inference(
     penalty: float,
     nbest: int,
     normalize_length: bool,
+    early_stop: bool,
     num_workers: int,
     log_level: Union[int, str],
     data_path_and_name_and_type: Sequence[Tuple[str, str, str]],
@@ -946,6 +949,7 @@ def inference(
         penalty=penalty,
         nbest=nbest,
         normalize_length=normalize_length,
+        early_stop=early_stop,
         quantize_s2t_model=quantize_s2t_model,
         quantize_lm=quantize_lm,
         quantize_modules=quantize_modules,
@@ -1225,6 +1229,14 @@ def get_parser():
         type=str2bool,
         default=False,
         help="If true, best hypothesis is selected by length-normalized scores",
+    )
+    group.add_argument(
+        "--early_stop",
+        type=str2bool,
+        default=False,
+        help="Stop the beam search of an utterance once its nbest ended hypotheses "
+        "cannot be beaten by any running one. Exact without a length bonus and "
+        "without normalize_length; it only saves time",
     )
 
     group = parser.add_argument_group("Text converter related")
